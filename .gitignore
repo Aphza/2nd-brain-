@@ -1,0 +1,13 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local agent state (do not commit conversation memory)
+agent_memory.json
+agent_memory.json.tmp
+
+# Secrets
+.env
