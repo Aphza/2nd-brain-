@@ -8,14 +8,14 @@ from datetime import datetime, timezone
 import llm_providers
 from agent_memory import (
     load_memory,
-    record_turn,
+    is_processed,
     mark_processed,
-    build_messages,
+    record_usage,
 )
 
-# Model/label used to stamp generated notes. Actual provider is chosen at call
-# time by llm_providers (Gemini -> Bedrock -> Groq).
-METADATA_SOURCE = "gemini->bedrock->groq"
+# Fallback label only; the real per-note source is the provider/model that
+# actually answered (e.g. "gemini/gemini-2.5-flash"), threaded through at runtime.
+DEFAULT_SOURCE = "gemini->bedrock->groq"
 
 DEFAULT_BATCH_SIZE = 5
 DEFAULT_TOKENS_PER_FILE = 150
@@ -64,7 +64,7 @@ def parse_frontmatter(text):
     return {}, text
 
 
-def build_frontmatter(fm):
+def build_frontmatter(fm, source=DEFAULT_SOURCE):
     lines = ["---"]
     if fm.get("title"):
         lines.append(f"title: {json.dumps(fm['title'])}")
@@ -79,7 +79,7 @@ def build_frontmatter(fm):
         for t in fm["topics"]:
             lines.append(f"  - {t}")
     lines.append(f"metadata_generated_at: {datetime.now(timezone.utc).isoformat()}")
-    lines.append(f"metadata_source: {METADATA_SOURCE}")
+    lines.append(f"metadata_source: {source}")
     lines.append("---\n")
     return "\n".join(lines)
 
@@ -88,27 +88,21 @@ def load_file(p):
     return parse_frontmatter(p.read_text(encoding="utf-8"))
 
 
-def save_file(p, fm, body):
-    p.write_text(build_frontmatter(fm) + body, encoding="utf-8")
+def save_file(p, fm, body, source=DEFAULT_SOURCE):
+    p.write_text(build_frontmatter(fm, source) + body, encoding="utf-8")
 
 
-def call(prompt, max_tokens, mem=None):
+def call(prompt, max_tokens):
     """Send ``prompt`` through the rotating provider chain.
 
-    Conversation history is always passed as a ``messages`` array. When ``mem``
-    is provided, prior turns are replayed and the new turn is persisted.
+    Returns the provider's :class:`llm_providers.LLMResult` (text + provider +
+    model + tokens) so the caller can attribute which provider/model answered.
     """
-    if mem is not None:
-        messages = build_messages(mem, SYSTEM_PROMPT, prompt)
-    else:
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ]
-    text = llm_providers.chat(messages, max_tokens=max_tokens, temperature=0.0)
-    if mem is not None:
-        record_turn(mem, prompt, text)
-    return text
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    return llm_providers.chat(messages, max_tokens=max_tokens, temperature=0.0)
 
 
 def parse_json(text):
@@ -141,8 +135,14 @@ def process_batch(batch, mem=None):
     ]
     for i, (p, fm, body) in enumerate(batch, 1):
         prompt.append(f"\nNOTE {i}: {fm.get('title') or p.stem}\n{clean(body)[:DEFAULT_PROMPT_CHARS]}")
-    raw = call("\n".join(prompt), n * DEFAULT_TOKENS_PER_FILE, mem=mem)
-    results = parse_json(raw)
+
+    result = call("\n".join(prompt), n * DEFAULT_TOKENS_PER_FILE)
+    # Attribute the exact provider/model that answered (task 3).
+    source = f"{result.provider}/{result.model}"
+    if mem is not None:
+        record_usage(mem, result.provider, result.tokens or 0)
+
+    results = parse_json(result.text)
     if not isinstance(results, list) or len(results) != n:
         raise RuntimeError(f"Expected {n} results, got {results}")
     for (p, fm, body), meta in zip(batch, results):
@@ -150,10 +150,22 @@ def process_batch(batch, mem=None):
         fm["summary"] = meta.get("summary", "")
         fm["tags"] = merge_tags(fm.get("tags"), meta.get("tags"))
         fm["topics"] = meta.get("topics", [])
-        save_file(p, fm, body)
+        save_file(p, fm, body, source)
         if mem is not None:
-            mark_processed(mem, p.name)
-        print("updated:", p.name)
+            mark_processed(mem, str(p.resolve()))
+        print(f"updated: {p.name}  [{source}]")
+
+
+def _log_failed(vault_dir: Path, batch, error: Exception) -> None:
+    """Append the failed files to ``failed_files.log`` so they can be reprocessed."""
+    stamp = datetime.now(timezone.utc).isoformat()
+    log_path = vault_dir / "failed_files.log"
+    try:
+        with log_path.open("a", encoding="utf-8") as fh:
+            for p, _fm, _body in batch:
+                fh.write(f"{stamp}\t{p.resolve()}\t{type(error).__name__}: {error}\n")
+    except OSError as e:
+        print(f"could not write failed_files.log: {e}")
 
 
 def main():
@@ -162,21 +174,29 @@ def main():
     parser.add_argument("--max-files", type=int, default=0)
     args = parser.parse_args()
 
-    # Load persistent memory before making any API call (Step 4).
+    vault_dir = Path(args.dir)
+
+    # Load persistent state before making any API call (task 5).
     mem = load_memory()
-    print(f"loaded memory: {len(mem.get('history', []))} prior turns, "
-          f"{len(mem.get('processed', []))} files already processed")
+    print(f"loaded memory: {len(mem.get('processed_files', []))} files already processed "
+          f"(run #{mem['session_stats']['runs']})")
     print(f"providers available: {llm_providers.available_providers() or 'NONE - check env'}")
 
-    files = sorted(Path(args.dir).glob("*.md"))
+    files = sorted(vault_dir.glob("*.md"))
     to_process = []
+    skipped = 0
     for p in files:
+        if is_processed(mem, str(p.resolve())):
+            skipped += 1
+            continue
         fm, body = load_file(p)
         if fm.get("tags"):
             continue
         to_process.append((p, fm, body))
         if args.max_files and len(to_process) >= args.max_files:
             break
+    if skipped:
+        print(f"skipping {skipped} file(s) already in processed_files")
 
     batches = [
         to_process[i:i + DEFAULT_BATCH_SIZE]
@@ -186,9 +206,13 @@ def main():
         try:
             process_batch(b, mem=mem)
         except Exception as e:
-            # Never let one bad batch crash the whole run.
-            print(f"batch failed ({e}); continuing with next batch")
+            # Never let one bad batch crash the run; log the files for reprocessing.
+            print(f"batch failed ({type(e).__name__}: {e}); logging and continuing")
+            _log_failed(vault_dir, b, e)
         time.sleep(DEFAULT_SLEEP)
+
+    stats = mem["session_stats"]
+    print(f"done. providers used: {stats['providers']} total_tokens={stats['total_tokens']}")
 
 
 if __name__ == "__main__":
