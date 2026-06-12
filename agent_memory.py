@@ -1,72 +1,81 @@
-"""Lightweight persistent conversation/context memory for the AI tooling.
+"""Lightweight persistent state for the batch metadata tooling.
 
-The metadata tooling is a batch job rather than a chat agent, but the project
-asked for durable memory so the agent "never forgets what it has been told or
-already built". This module provides:
+This is a *batch* job, not a chat agent, so replaying a chat-style messages
+array on every call is wasteful and risks overflowing the model context. Instead
+this module persists only what is useful between runs:
 
-    * a single ``agent_memory.json`` file in the working directory,
-    * loaded once at the start of a session (before any API call),
-    * appended to after every turn (request + response), then re-persisted.
+    * ``processed_files`` - absolute paths of notes already successfully enriched,
+      so a re-run skips them instead of re-spending tokens.
+    * ``session_stats``   - per-provider call counts and total tokens used.
 
-History is passed to the model as a ``messages`` array on every call. To keep
-prompts within token limits, :func:`build_messages` only replays the most recent
-``MAX_HISTORY_TURNS`` turns, while the JSON file keeps the full record.
+State lives in a single ``agent_memory.json`` file, loaded once before the first
+API call and re-saved (atomically) after every successful file/turn.
 """
 
 import json
 from pathlib import Path
 
 MEMORY_PATH = Path("agent_memory.json")
-MEMORY_VERSION = 1
+MEMORY_VERSION = 2
 
-# How many recent turns to replay into the prompt (full history is still saved).
-MAX_HISTORY_TURNS = 20
+
+def _fresh() -> dict:
+    return {
+        "version": MEMORY_VERSION,
+        "processed_files": [],
+        "session_stats": {"providers": {}, "total_tokens": 0, "runs": 0},
+    }
 
 
 def load_memory(path: Path = MEMORY_PATH) -> dict:
-    """Load persisted memory, or return a fresh structure if none/corrupt."""
+    """Load persisted state, migrating older formats, or return a fresh structure."""
+    mem = _fresh()
     if path.exists():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and "history" in data:
-                data.setdefault("processed", [])
-                data.setdefault("version", MEMORY_VERSION)
-                return data
+            if isinstance(data, dict):
+                # Migrate the v1 chat-memory format (had "history"/"processed").
+                if "processed_files" not in data and "processed" in data:
+                    data["processed_files"] = data.get("processed", [])
+                mem["processed_files"] = list(dict.fromkeys(data.get("processed_files", [])))
+                stats = data.get("session_stats", {})
+                if isinstance(stats, dict):
+                    mem["session_stats"]["providers"] = dict(stats.get("providers", {}))
+                    mem["session_stats"]["total_tokens"] = stats.get("total_tokens", 0)
+                    mem["session_stats"]["runs"] = stats.get("runs", 0)
         except (json.JSONDecodeError, OSError):
             pass
-    return {"version": MEMORY_VERSION, "history": [], "processed": []}
+    mem["session_stats"]["runs"] += 1
+    return mem
 
 
 def save_memory(mem: dict, path: Path = MEMORY_PATH) -> None:
-    """Persist memory atomically to avoid corrupting the file on crash."""
+    """Persist state atomically to avoid corrupting the file on crash."""
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(mem, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
 
 
-def record_turn(mem: dict, user: str, assistant: str, path: Path = MEMORY_PATH) -> None:
-    """Append a user/assistant turn to memory and persist immediately."""
-    mem.setdefault("history", []).append({"role": "user", "content": user})
-    mem["history"].append({"role": "assistant", "content": assistant})
-    save_memory(mem, path)
+def is_processed(mem: dict, path) -> bool:
+    """True if ``path`` has already been successfully enriched in a prior run."""
+    return str(path) in set(mem.get("processed_files", []))
 
 
-def mark_processed(mem: dict, name: str, path: Path = MEMORY_PATH) -> None:
-    """Remember that a note/file has been handled so re-runs can skip it."""
-    processed = mem.setdefault("processed", [])
-    if name not in processed:
-        processed.append(name)
-        save_memory(mem, path)
+def mark_processed(mem: dict, path, mem_path: Path = MEMORY_PATH) -> None:
+    """Record that ``path`` was enriched and persist immediately."""
+    key = str(path)
+    processed = mem.setdefault("processed_files", [])
+    if key not in processed:
+        processed.append(key)
+        save_memory(mem, mem_path)
 
 
-def build_messages(mem: dict, system: str, user: str) -> list[dict]:
-    """Build a messages array: system + recent history + the new user turn."""
-    messages: list[dict] = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    history = mem.get("history", [])
-    if MAX_HISTORY_TURNS:
-        history = history[-(MAX_HISTORY_TURNS * 2):]
-    messages.extend(history)
-    messages.append({"role": "user", "content": user})
-    return messages
+def record_usage(mem: dict, provider: str, tokens: int = 0, mem_path: Path = MEMORY_PATH) -> None:
+    """Increment per-provider call counts and total token usage, then persist."""
+    stats = mem.setdefault("session_stats", {"providers": {}, "total_tokens": 0, "runs": 0})
+    providers = stats.setdefault("providers", {})
+    entry = providers.setdefault(provider, {"calls": 0, "tokens": 0})
+    entry["calls"] += 1
+    entry["tokens"] += int(tokens or 0)
+    stats["total_tokens"] = stats.get("total_tokens", 0) + int(tokens or 0)
+    save_memory(mem, mem_path)
